@@ -52,12 +52,6 @@ try:
 except ImportError:
     HAS_HEXRAYS = False
 
-try:
-    import ida_nalt
-    HAS_NALT = True
-except ImportError:
-    HAS_NALT = False
-
 #### pointer width ###
 
 def _is_64bit():
@@ -70,6 +64,19 @@ _FF_PTR  = idc.FF_QWORD if PTR_SIZE == 8 else idc.FF_DWORD
 
 def read_ptr(ea):
     return ida_bytes.get_qword(ea) if PTR_SIZE == 8 else ida_bytes.get_dword(ea)
+
+def _is_arm():
+    try:
+        return idaapi.ph.id == idaapi.PLFM_ARM
+    except Exception:
+        return False
+
+# arm64-v8a (Android) sometimes tags pointer top bits (PAC / memory tagging);
+# x86_64 doesn't, so only mask there.
+IS_ARM64 = _is_arm() and PTR_SIZE == 8
+
+def _mask_ptr(val):
+    return (val & 0x00FFFFFFFFFFFFFF) if (IS_ARM64 and val) else val
 
 #### helpers ###
 
@@ -115,7 +122,7 @@ def _is_sentinel(ea):
     val = read_ptr(ea)
     if val != 0 and not (val > 0xFFFFFFFF00000000):
         return False
-    nxt = read_ptr(ea + PTR_SIZE)
+    nxt = _mask_ptr(read_ptr(ea + PTR_SIZE))
     if not _seg_ok(nxt):
         return False
     nm = _name(nxt)
@@ -130,7 +137,7 @@ def _raw_slots(vtable_ea):
     while ea < seg.end_ea:
         if _is_sentinel(ea):
             break
-        func_ea = read_ptr(ea)
+        func_ea = _mask_ptr(read_ptr(ea))
         if func_ea != 0 and not _exec_seg(func_ea):
             break
         slots.append(func_ea)
@@ -192,18 +199,6 @@ def build_shared_owner_map(classnames):
 def slot_owner_fast(slot_idx, func_ea, classname):
     return _shared_owner_map.get((slot_idx, func_ea), classname)
 
-#### renaming in IDA ###
-
-def _rename(func_ea, classname, slot_idx):
-    current = _name(func_ea)
-    new_nm  = "{}_v{}".format(_safe_id(classname), slot_idx)
-    if (re.match(r"^(sub_|nullsub_|j_|loc_)", current)
-            or re.match(r"^[A-Za-z_]\w+_v\d+$", current)):
-        ida_name.set_name(func_ea, new_nm, ida_name.SN_NOWARN)
-        idc.set_func_cmt(func_ea,
-            "[vtable] {}::v{}".format(_safe_id(classname), slot_idx), 1)
-    return new_nm
-
 #### decompile a single slot (Hex-Rays) ###
 
 _BOILER = re.compile(
@@ -256,7 +251,7 @@ if HAS_HEXRAYS:
 
             offset = num_op.numval()
             parent = self.parent_expr()
-            size, tname = 0, "void*"
+            size, tname = 0, "?"  # "?" = no parent context at all, distinct from a real void*
 
             if parent:
                 if parent.op == ida_hexrays.cot_ptr:
@@ -299,20 +294,6 @@ def _scan_struct_fields(func_ea, struct_fields):
         for off, info in visitor.fields.items():
             if off not in struct_fields or struct_fields[off]['size'] < info['size']:
                 struct_fields[off] = info
-    except Exception:
-        pass
-
-#### colours ###
-
-COLOR_DTOR, COLOR_PURE, COLOR_OWN, COLOR_INDEF = 0xFFE8FF, 0xFFE8C8, 0xC8FFC8, 0xE8E8E8
-
-def _color(func_ea, is_own, is_dtor, is_pure):
-    if not HAS_NALT or not func_ea:
-        return
-    c = (COLOR_DTOR if is_dtor else COLOR_PURE if is_pure
-         else COLOR_OWN if is_own else COLOR_INDEF)
-    try:
-        ida_nalt.set_item_color(func_ea, c)
     except Exception:
         pass
 
@@ -500,7 +481,12 @@ def _clean_type(tname, size):
     ]:
         t = re.sub(pattern, repl, t)
     t = re.sub(r"\s+\*", "*", t)
-    if re.match(r"^_[A-Z]", t) or t in ("void", ""):
+    if t == "?":
+        # no deref/cast/asg context recovered for this field at all — lone single
+        # bytes are far more often bools than raw bytes in these structs, and a
+        # bare numeric-context field is more often int than pointer.
+        t = {1: "bool", 2: "uint16_t", 4: "int32_t", 8: "int64_t"}.get(size, "uint8_t[{}]".format(size))
+    elif re.match(r"^_[A-Z]", t) or t in ("void", ""):
         t = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}.get(size, "uint8_t[{}]".format(size))
     return t
 
@@ -549,24 +535,41 @@ def format_header(result):
     lines.append("};")
 
     for sec in result.get("secondary_vtables", []):
-        lines.append("\n// Secondary vtable  offset_to_top={}  @{}:".format(
-            sec["offset_to_top"], hex(sec["vtable_ea"])))
+        ott      = sec["offset_to_top"]
+        sec_safe = "{}_{}04X{}".format(safe, abs(ott), VTBL_SUFFIX)
+        lines.append("\n// Secondary vtable  offset_to_top={}  @{}".format(ott, hex(sec["vtable_ea"])))
+        lines.append("struct {} {{".format(sec_safe))
         for s in sec["slots"]:
-            lines.append("//   [{:3d}] {:#x}  {}".format(
-                s["index"], s["ea"] or 0, s["demangled"] or s["func_name"]))
+            nm = _safe_id(s["func_name"]) if s.get("func_name") else "v{}".format(s["index"])
+            lines.append("    void* {};  // [{}] {:#x}  {}".format(
+                nm, s["index"], s["ea"] or 0, s.get("demangled") or ""))
+        lines.append("};")
 
     fields = result.get("struct_fields", {})
     if fields and len(fields) > 1:
-        lines += ["", "// Struct layout (recovered via AST):", "struct {}_Layout {{".format(safe)]
+        lines += ["", "// Struct layout (recovered via AST, heuristic — verify against real headers):",
+                   "struct {}_Layout {{".format(safe)]
         offsets, current = sorted(fields.keys()), 0
-        for off in offsets:
+        for i, off in enumerate(offsets):
             if off < current:
                 continue
             if off > current:
                 lines.append("    char pad_{:x}[{:#x}];  // gap".format(current, off - current))
                 current = off
+
             info = fields[off]
-            tname, size = _clean_type(info.get('type', 'void*'), info.get('size', PTR_SIZE)), info.get('size', PTR_SIZE)
+            size = info.get('size', PTR_SIZE)
+            nxt  = offsets[i + 1] if i + 1 < len(offsets) else None
+
+            # ptr-sized field with nothing else recorded for the next 24 bytes —
+            # looks like libstdc++'s {ptr, size, capacity} std::string layout.
+            if off != 0 and size in (4, 8) and nxt is not None and nxt >= off + 32:
+                lines.append("    {:<40} // {:#x}  (heuristic: ptr+len+cap)".format(
+                    "::std::string field_{:x};".format(off), off))
+                current = off + 32
+                continue
+
+            tname = _clean_type(info.get('type', 'void*'), size)
             decl = "void** __vftable;" if off == 0 else "{} field_{:x};".format(tname, off)
             lines.append("    {:<40} // {:#x}".format(decl, off))
             current += size
@@ -580,13 +583,22 @@ def format_pseudocode(result):
         return "// ERROR: {}\n".format(result["error"])
 
     lines = ["#pragma once", "// Pseudocode: {}  |  Dumper".format(result["class"]), ""]
-    for s in result["slots"]:
-        if s.get("pseudo"):
-            lines += ["// [{}] {}  owner:{}".format(s["index"], s["func_name"], s["owner"]),
-                       s["pseudo"], ""]
-        elif s["ea"] and s["role"] == "func":
-            lines.append("// [{:3d}] {:#x}  {} — decompile unavailable".format(
-                s["index"], s["ea"], s["func_name"]))
+
+    def _dump_slots(slots, tag):
+        for s in slots:
+            if s.get("pseudo"):
+                lines.append("// [{}{}] {}  owner:{}".format(tag, s["index"], s["func_name"], s["owner"]))
+                lines.append(s["pseudo"])
+                lines.append("")
+            elif s["ea"] and s["role"] == "func":
+                lines.append("// [{}{:3d}] {:#x}  {} — decompile unavailable".format(
+                    tag, s["index"], s["ea"], s["func_name"]))
+
+    _dump_slots(result["slots"], "")
+    for sec in result.get("secondary_vtables", []):
+        lines.append("\n// ── secondary vtable offset_to_top={} ──".format(sec["offset_to_top"]))
+        _dump_slots(sec["slots"], "sec{}:".format(abs(sec["offset_to_top"])))
+
     if not HAS_HEXRAYS:
         lines.append("// Hex-Rays not available.")
     return "\n".join(lines)
@@ -646,7 +658,7 @@ def format_diff(cn_a, cn_b, rows):
 _DELETING_DTOR_RE = re.compile(r"D0Ev$")
 _DTOR_RE          = re.compile(r"D[12]Ev$")
 
-def extract(classname, rename=False, colours=False, pseudo=False, structs=False):
+def extract(classname, pseudo=False, structs=False):
     """
     Returns: {class, ti_ea, vtable_ea, slots:[{index,ea,role,owner,func_name,
     demangled,pseudo?}], secondary_vtables:[...], struct_fields:{offset:{size,type}}, error}
@@ -689,16 +701,10 @@ def extract(classname, rename=False, colours=False, pseudo=False, structs=False)
             }
 
             if func_ea:
-                if rename and role == "func":
-                    slot["func_name"] = _rename(func_ea, owner, idx)
-                if colours:
-                    _color(func_ea, owner == classname, role in ("dtor", "deleting_dtor"), False)
                 if pseudo and role == "func":
                     slot["pseudo"] = _decompile(func_ea)
                 if structs:
                     _scan_struct_fields(func_ea, result["struct_fields"])
-            elif colours:
-                _color(0, False, False, True)
 
             slots.append(slot)
         return slots
@@ -715,6 +721,24 @@ def extract(classname, rename=False, colours=False, pseudo=False, structs=False)
 
 #### IDA plugin ###
 
+class _ExtractForm(idaapi.Form):
+    def __init__(self):
+        idaapi.Form.__init__(self, r"""STARTITEM 0
+Dumper
+Blank Classes = scan every _ZTV. Fill Diff to compare two classes (ignores checkboxes).
+<Classes      :{cnClasses}>
+<Diff against :{cnDiff}>
+<Output folder:{cnOutFile}>
+<##Options##Decompile pseudocode (Hex-Rays):{cPseudo}>
+<Recover struct fields + IDA structs:{cStructs}>{cGroup}>
+""", {
+            'cnClasses': idaapi.Form.StringInput(swidth=50),
+            'cnDiff':    idaapi.Form.StringInput(swidth=50),
+            'cnOutFile': idaapi.Form.DirInput(swidth=56),
+            'cGroup':    idaapi.Form.ChkGroupControl(("cPseudo", "cStructs")),
+        })
+
+
 class VtableExtractorPlugin(idaapi.plugin_t):
     flags         = idaapi.PLUGIN_UNL
     comment       = "Extract + rename vtables from RTTI — v2.0"
@@ -726,32 +750,21 @@ class VtableExtractorPlugin(idaapi.plugin_t):
     def term(self):  pass
 
     def run(self, _arg):
-        # ── inputs ────────────────────────────────────────────────────────────
-        classes_raw = (idaapi.ask_str("", 0,
-            "VTable Extractor v2.0\n"
-            "Classes (comma-separated, blank = scan all _ZTV):") or "").strip()
+        f = _ExtractForm()
+        f.Compile()
+        f.cPseudo.checked = True
+        f.cStructs.checked = True
+        if not f.Execute():
+            f.Free(); return
 
-        diff_b = (idaapi.ask_str("", 0,
-            "Diff against (leave blank to skip diff):\n"
-            "If filled: diffs first class above vs this one, ignores options below.") or "").strip()
-
-        picker = idaapi.ask_file(True, "*.*", "Pick any file in your output folder:")
-        if not picker:
-            return
-        out_dir = os.path.dirname(picker)
-
-        # ── options (mirrors original checkbox group) ─────────────────────────
-        do_rename  = idaapi.ask_buttons("Yes", "No", "Cancel", 1,
-            "Rename sub_XXXX → Class_vN in IDA?") == 1
-        do_colours = idaapi.ask_buttons("Yes", "No", "Cancel", 1,
-            "Apply slot colours?") == 1
-        do_pseudo  = idaapi.ask_buttons("Yes", "No", "Cancel", 1,
-            "Decompile pseudocode (Hex-Rays)?") == 1
-        do_structs = idaapi.ask_buttons("Yes", "No", "Cancel", 1,
-            "Recover struct fields + IDA structs?") == 1
+        classes_raw = f.cnClasses.value.strip()
+        diff_b      = f.cnDiff.value.strip()
+        out_dir     = f.cnOutFile.value
+        do_pseudo, do_structs = f.cPseudo.checked, f.cStructs.checked
+        f.Free()
 
         if not out_dir:
-            idaapi.warning("Enter an output directory path."); return
+            idaapi.warning("Pick an output folder."); return
         if not os.path.isdir(out_dir):
             idaapi.warning("Directory not found: {}".format(out_dir)); return
 
@@ -782,8 +795,7 @@ class VtableExtractorPlugin(idaapi.plugin_t):
                 idaapi.replace_wait_box("Extracting — {} / {}  —  {}".format(
                     i + 1, len(classnames), cn))
 
-                r = extract(cn, rename=do_rename, colours=do_colours,
-                            pseudo=do_pseudo, structs=do_structs)
+                r = extract(cn, pseudo=do_pseudo, structs=do_structs)
                 idaapi.msg("[Dumper] {}: {}\n".format(
                     cn, r.get("error") or "{} slots".format(len(r["slots"]))))
                 if r.get("error"):
