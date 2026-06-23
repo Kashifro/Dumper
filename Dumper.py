@@ -1,47 +1,23 @@
 """
 Dumper5000
-struct API (get_struc/add_struc/...) via idc in
-this build, not ida_struct/idaapi, resolved dynamically below.
+RTTI-based vtable extractor for IDA Pro. struct creation goes through idc
+directly (get_struc_id/add_struc/add_struc_member); only the optional
+tinfo-on-member annotation falls back between ida_struct/idaapi, since that
+one's missing entirely on some IDA builds.
 """
 
 import idaapi, idautils, idc, ida_name, ida_bytes, ida_segment, ida_ida
 import os, re
-import sys as _sys
 
-#### struct API compat shim ###
-def _resolve(attr, *preferred_modules):
-    plugin_tag = "funcfinder"
-    for mod_name in preferred_modules:
-        mod = _sys.modules.get(mod_name)
-        if mod is None:
-            try:    mod = __import__(mod_name)
-            except ImportError: continue
-        if plugin_tag in (getattr(mod, "__name__", "") or ""):
-            continue
-        v = getattr(mod, attr, None)
-        if v is not None:
-            return v
-    return None
-
-_get_struc_id     = _resolve("get_struc_id",    "idc", "ida_struct", "idaapi")
-_add_struc        = _resolve("add_struc",        "idc", "ida_struct", "idaapi")
-_add_struc_member = _resolve("add_struc_member", "idc", "ida_struct", "idaapi")
-_get_struc        = _resolve("get_struc",        "ida_struct", "idaapi")
-_get_member       = _resolve("get_member",       "ida_struct", "idaapi")
-_set_member_tinfo = _resolve("set_member_tinfo", "ida_struct", "idaapi")
-
-_STRUC_ERROR_OK   = _resolve("STRUC_ERROR_MEMBER_OK",   "idc", "ida_struct", "idaapi") or 0
-_STRUC_ERROR_NAME = _resolve("STRUC_ERROR_MEMBER_NAME", "idc", "ida_struct", "idaapi") or -32
-
-if _add_struc_member is None: _add_struc_member = lambda *a, **kw: -1
-if _get_member       is None: _get_member       = lambda *a, **kw: None
-if _set_member_tinfo is None: _set_member_tinfo = lambda *a, **kw: False
-
-def _diag():
-    idaapi.msg("[Dumper] struct API: get_struc_id={} add_struc={} "
-               "add_struc_member={}\n".format(
-        bool(_get_struc_id), bool(_add_struc), bool(_add_struc_member)))
-_diag()
+# tinfo-on-member setters live on ida_struct in some IDA builds, on idaapi in
+# others, and on neither in this idc-only build — tinfo is a nice-to-have, so
+# missing means "skip it", not "crash".
+try:
+    from ida_struct import get_struc, get_member, set_member_tinfo
+except ImportError:
+    get_struc       = getattr(idaapi, "get_struc", None)
+    get_member      = getattr(idaapi, "get_member", None)
+    set_member_tinfo = getattr(idaapi, "set_member_tinfo", None)
 
 VTBL_SUFFIX  = "__vtbl"
 VTBL_MEMNAME = "__vftable"
@@ -61,6 +37,11 @@ def _is_64bit():
 PTR_SIZE = 8 if _is_64bit() else 4
 BADADDR  = idaapi.BADADDR
 _FF_PTR  = idc.FF_QWORD if PTR_SIZE == 8 else idc.FF_DWORD
+
+# this build doesn't expose the STRUC_ERROR_MEMBER_* names — values are
+# stable across IDA versions (0 = ok, -3 = name collision), so fall back to them.
+_STRUC_ERROR_OK   = getattr(idc, "STRUC_ERROR_MEMBER_OK", 0)
+_STRUC_ERROR_NAME = getattr(idc, "STRUC_ERROR_MEMBER_NAME", -3)
 
 def read_ptr(ea):
     return ida_bytes.get_qword(ea) if PTR_SIZE == 8 else ida_bytes.get_dword(ea)
@@ -85,7 +66,11 @@ def _seg_ok(ea):
 
 def _exec_seg(ea):
     s = ida_segment.getseg(ea)
-    return bool(s and s.perm & ida_segment.SEGPERM_EXEC)
+    if not s:
+        return False
+    # extern/import stubs (e.g. __cxa_pure_virtual) commonly land in an XTRN
+    # segment with no exec perm — that's a real vtable slot, not end-of-array.
+    return bool(s.perm & ida_segment.SEGPERM_EXEC) or s.type == idaapi.SEG_XTRN
 
 def _name(ea):
     return ida_name.get_name(ea) or ""
@@ -107,13 +92,37 @@ def _strip_len(mangled):
 def find_typeinfo(classname):
     bare = _strip_len(classname)
     for name in dict.fromkeys([bare, classname]):
-        sym = "_ZTI{}{}".format(len(name), name)
-        ea  = ida_name.get_name_ea(BADADDR, sym)
+        if name.startswith("N") and name.endswith("E"):
+            sym = "_ZTI{}".format(name)                       # already a mangled nested-name, e.g. N3mce12TextureGroupE
+        elif "::" in name:
+            parts = name.split("::")
+            sym = "_ZTIN{}E".format("".join("{}{}".format(len(p), p) for p in parts))  # mce::TextureGroup → N3mce12TextureGroupE
+        else:
+            sym = "_ZTI{}{}".format(len(name), name)          # flat identifier, e.g. 4Item
+        ea = ida_name.get_name_ea(BADADDR, sym)
         if ea != BADADDR:
             return ea
     for ea, sym in idautils.Names():
         if "ZTI" in sym and bare in sym:
             return ea
+    return BADADDR
+
+def find_vtable_direct(classname):
+    """Fallback when there's no _ZTI (e.g. partial -fno-rtti, or the class is never
+    dynamic_cast/typeid'd so the compiler dropped RTTI but kept the vtable). No ancestor
+    chain exists without RTTI, so slots from this path never climb — owner is always self."""
+    bare = _strip_len(classname)
+    for name in dict.fromkeys([bare, classname]):
+        if name.startswith("N") and name.endswith("E"):
+            sym = "_ZTV{}".format(name)
+        elif "::" in name:
+            parts = name.split("::")
+            sym = "_ZTVN{}E".format("".join("{}{}".format(len(p), p) for p in parts))
+        else:
+            sym = "_ZTV{}{}".format(len(name), name)
+        ea = ida_name.get_name_ea(BADADDR, sym)
+        if ea != BADADDR:
+            return ea + PTR_SIZE  # symbol sits at the offset-to-top header, not the first slot
     return BADADDR
 
 #### vtable discovery & slot reading ###
@@ -166,54 +175,73 @@ def vtable_chunks(ti_ea):
     chunks.sort(key=lambda t: (t[0] != 0, t[0]))
     return chunks
 
-#### slot ownership ###
-# a slot shared by >= SHARED_THRESHOLD classes is just tagged
-# "vfunc" — no ancestor-chain walk to find which base actually owns it.
+#### slot ownership via RTTI ancestor walk ###
+# We don't trust the typeinfo's own vtable-pointer name to decide si vs vmi —
+# in this it can point at the vmi vtable while word[2] still holds a
+# plain single direct parent pointer (si-shaped data, vmi-named vtable; maybe
+# ICF/weak-symbol folding). Instead validate the data itself: try the simple
+# single-pointer read first, and only fall back to the real vmi
+# [flags][base_count][base_ti_ptr,...]×N parse if that doesn't look sane.
 
-SHARED_THRESHOLD = 2
-_shared_owner_map = {}
+def _looks_like_ti_ptr(ea):
+    """True if `ea` is a pointer to a real type_info object (named _ZTI...)."""
+    return _seg_ok(ea) and _name(ea).startswith("_ZTI")
 
-def build_shared_owner_map(classnames):
-    global _shared_owner_map
-    _shared_owner_map = {}
-    slot_ea_classes = {}
+def _parent_ti(ti_ea):
+    """Base type_info ptr to walk for primary-vtable ownership, or None at the root."""
+    direct = _mask_ptr(read_ptr(ti_ea + 2 * PTR_SIZE))
+    if _looks_like_ti_ptr(direct):
+        return direct
+    base_count = ida_bytes.get_dword(ti_ea + 2 * PTR_SIZE + 4)
+    base_ti = _mask_ptr(read_ptr(ti_ea + 2 * PTR_SIZE + 8)) if base_count >= 1 else None
+    return base_ti if (base_ti and _looks_like_ti_ptr(base_ti)) else None
 
-    for cn in classnames:
-        ti_ea = find_typeinfo(cn)
-        if ti_ea == BADADDR:
-            continue
-        chunks = vtable_chunks(ti_ea)
-        if not chunks:
-            continue
-        for idx, ea in enumerate(_raw_slots(chunks[0][1])):
-            if ea:
-                slot_ea_classes.setdefault(idx, {}).setdefault(ea, []).append(cn)
+def _classname_from_ti(ti_ea):
+    dem = _demangled(ti_ea)
+    if dem.startswith("typeinfo for "):
+        return dem[len("typeinfo for "):]
+    nm = _name(ti_ea)
+    return _strip_len(nm[4:]) if nm.startswith("_ZTI") else nm
 
-    for slot_idx, ea_map in slot_ea_classes.items():
-        for ea, classes in ea_map.items():
-            if len(classes) >= SHARED_THRESHOLD:
-                _shared_owner_map[(slot_idx, ea)] = "vfunc"
+def _ancestor_owner_table(ti_ea, ott=0):
+    """[(classname, slots_for_this_offset_domain), ...] for self + every ancestor, computed
+    ONCE per domain (not once per slot — vtable_chunks does an xref scan, too slow to repeat
+    19x). `ott` selects which chunk: 0 for the primary vtable, nonzero for a secondary
+    (multiple-inheritance) domain. An ancestor with no chunk at that exact offset breaks the
+    climb there — correct when the offset is consistent up the chain, which covers the
+    common single-level-MI case but isn't guaranteed once a base's placement shifts deeper
+    in a multi-level diamond hierarchy."""
+    table, seen, cur = [], set(), ti_ea
+    while cur and cur not in seen:
+        seen.add(cur)
+        chunks = vtable_chunks(cur)
+        match  = next((c for c in chunks if c[0] == ott), None)
+        slots  = _raw_slots(match[1]) if match else []
+        table.append((_classname_from_ti(cur), slots))
+        cur = _parent_ti(cur)
+    return table
 
-    return _shared_owner_map
-
-def slot_owner_fast(slot_idx, func_ea, classname):
-    return _shared_owner_map.get((slot_idx, func_ea), classname)
+def slot_owner(owner_table, classname, slot_idx, func_ea):
+    """Walk the precomputed ancestor table while func_ea still matches at this index —
+    the most-base match is who actually declared/owns the slot."""
+    owner = classname
+    for cn, slots in owner_table[1:]:
+        if slot_idx >= len(slots) or slots[slot_idx] != func_ea:
+            break
+        owner = cn
+    return owner
 
 #### decompile a single slot (Hex-Rays) ###
-
-_BOILER = re.compile(
-    r"^\s*(?:if\s*\(\s*[!]?\s*\w+\s*\)\s*(?:return[^;]*;|goto\s+\w+;)"
-    r"|memset\s*\(|qmemcpy\s*\(|(?:free|operator\s+delete)\s*\()\s*$",
-    re.IGNORECASE)
 
 def _decompile(func_ea):
     if not HAS_HEXRAYS or not func_ea:
         return None
     try:
-        cfunc = ida_hexrays.decompile(func_ea)
-        if not cfunc:
-            return None
-        return "\n".join(l for l in str(cfunc).splitlines() if not _BOILER.match(l))
+        hf = ida_hexrays.hexrays_failure_t()
+        cfunc = ida_hexrays.decompile(func_ea, hf)
+        if cfunc:
+            return str(cfunc)
+        return "// decompile failed: {}".format(hf.desc() if hf else "unknown")
     except Exception as ex:
         return "// decompile failed: {}".format(ex)
 
@@ -297,61 +325,38 @@ def _scan_struct_fields(func_ea, struct_fields):
     except Exception:
         pass
 
-#### IDA struct creation (IDA 9.x compatible, idc-only) ###
+#### IDA struct creation (idc-only, IDA 9.x) ###
 
 def _get_or_create_struc(name):
     safe_name = name if name[:1].isalpha() or name[:1] == "_" else "_" + name
-    sid = _get_struc_id(safe_name) if _get_struc_id else BADADDR
+    sid = idc.get_struc_id(safe_name)
     if sid in (BADADDR, None, idc.BADADDR):
-        try:    sid = _add_struc(idc.BADADDR, safe_name, 0)
-        except TypeError:
-            try: sid = _add_struc(idc.BADADDR, safe_name)
-            except Exception: return BADADDR
+        sid = idc.add_struc(idc.BADADDR, safe_name, 0)
     return sid
 
 def _add_or_skip_member(sid, name, offset, tinfo):
     """Add a pointer-sized member at `offset`. Returns True if it exists after the call."""
     if sid in (None, BADADDR, idc.BADADDR):
         return False
-    try:
-        if idc.get_member_name(sid, offset):
-            return True
-    except Exception:
-        pass
+    if idc.get_member_name(sid, offset):
+        return True
 
     flag = _FF_PTR | idc.FF_0OFF
-    serr = None
-    for args in [(sid, name, offset, flag, -1, PTR_SIZE),
-                 (sid, name, offset, flag,  0, PTR_SIZE),
-                 (sid, name, offset, flag,     PTR_SIZE)]:
-        try:
-            serr = _add_struc_member(*args)
-            break
-        except TypeError:
-            continue
-        except Exception as e:
-            idaapi.msg("  [dbg] add_struc_member exception: {}\n".format(e))
-            break
+    serr = idc.add_struc_member(sid, name, offset, flag, -1, PTR_SIZE)
 
     if serr == _STRUC_ERROR_NAME:
         alt = "{}_at_{:x}".format(name, offset)
-        for args in [(sid, alt, offset, flag, -1, PTR_SIZE),
-                     (sid, alt, offset, flag,     PTR_SIZE)]:
-            try:
-                serr = _add_struc_member(*args)
-                break
-            except TypeError:
-                continue
+        serr = idc.add_struc_member(sid, alt, offset, flag, -1, PTR_SIZE)
 
     if serr != _STRUC_ERROR_OK:
         return False
 
-    if tinfo is not None and _get_member and _set_member_tinfo:
+    if tinfo is not None and get_struc and get_member and set_member_tinfo:
         try:
-            struc = _get_struc(sid) if _get_struc else sid
-            mem   = _get_member(struc, offset) if struc else None
+            struc = get_struc(sid)
+            mem   = get_member(struc, offset) if struc else None
             if mem:
-                _set_member_tinfo(struc, mem, 0, tinfo, 0)
+                set_member_tinfo(struc, mem, 0, tinfo, 0)
         except Exception:
             pass
     return True
@@ -522,6 +527,9 @@ def format_header(result):
         elif s["role"] == "deleting_dtor":
             lines.append("    // [deleting dtor]  // [{}] {} {}".format(
                 s["index"], ea_hex, s["func_name"]))
+        elif s["role"] == "deleted_virtual":
+            lines.append("    virtual void vfunc_{}() = delete;  // [{}] {}{}".format(
+                s["index"], s["index"], ea_hex, owner_note))
         else:
             dem = s.get("demangled", "") or ""
             if "::" in dem and "(" in dem:
@@ -541,8 +549,9 @@ def format_header(result):
         lines.append("struct {} {{".format(sec_safe))
         for s in sec["slots"]:
             nm = _safe_id(s["func_name"]) if s.get("func_name") else "v{}".format(s["index"])
-            lines.append("    void* {};  // [{}] {:#x}  {}".format(
-                nm, s["index"], s["ea"] or 0, s.get("demangled") or ""))
+            owner_note = "" if s["owner"] == result["class"] else "  // from {}".format(s["owner"])
+            lines.append("    void* {};  // [{}] {:#x}  {}{}".format(
+                nm, s["index"], s["ea"] or 0, s.get("demangled") or "", owner_note))
         lines.append("};")
 
     fields = result.get("struct_fields", {})
@@ -550,7 +559,7 @@ def format_header(result):
         lines += ["", "// Struct layout (recovered via AST, heuristic — verify against real headers):",
                    "struct {}_Layout {{".format(safe)]
         offsets, current = sorted(fields.keys()), 0
-        for i, off in enumerate(offsets):
+        for off in offsets:
             if off < current:
                 continue
             if off > current:
@@ -559,16 +568,6 @@ def format_header(result):
 
             info = fields[off]
             size = info.get('size', PTR_SIZE)
-            nxt  = offsets[i + 1] if i + 1 < len(offsets) else None
-
-            # ptr-sized field with nothing else recorded for the next 24 bytes —
-            # looks like libstdc++'s {ptr, size, capacity} std::string layout.
-            if off != 0 and size in (4, 8) and nxt is not None and nxt >= off + 32:
-                lines.append("    {:<40} // {:#x}  (heuristic: ptr+len+cap)".format(
-                    "::std::string field_{:x};".format(off), off))
-                current = off + 32
-                continue
-
             tname = _clean_type(info.get('type', 'void*'), size)
             decl = "void** __vftable;" if off == 0 else "{} field_{:x};".format(tname, off)
             lines.append("    {:<40} // {:#x}".format(decl, off))
@@ -623,40 +622,14 @@ def scan_all_classnames():
             ea  = nxt if (nxt != BADADDR and nxt > ea) else ea + PTR_SIZE
     return sorted(result)
 
-#### vtable diff ###
-
-def diff_vtables(cn_a, cn_b):
-    def _slots(cn):
-        ti = find_typeinfo(cn)
-        if ti == BADADDR: return []
-        chunks = vtable_chunks(ti)
-        return _raw_slots(chunks[0][1]) if chunks else []
-    sa, sb = _slots(cn_a), _slots(cn_b)
-    rows = []
-    for i in range(max(len(sa), len(sb))):
-        ea_a = sa[i] if i < len(sa) else None
-        ea_b = sb[i] if i < len(sb) else None
-        st = ("ADDED" if ea_a is None else "REMOVED" if ea_b is None
-              else "SAME" if ea_a == ea_b else "CHANGED")
-        rows.append({"index": i, "status": st, "ea_a": ea_a, "ea_b": ea_b,
-                     "name_a": _demangled(ea_a) if ea_a else "—",
-                     "name_b": _demangled(ea_b) if ea_b else "—"})
-    return rows
-
-def format_diff(cn_a, cn_b, rows):
-    MARK = {"SAME": " ", "CHANGED": "~", "ADDED": "+", "REMOVED": "-"}
-    lines = ["// vtable diff: {}  vs  {}".format(cn_a, cn_b),
-              "{:<5}  {:<10}  {:<48}  {}".format("idx", "status", cn_a, cn_b), "─" * 100]
-    for r in rows:
-        lines.append("[{}] {:3d}  {:<10}  {:<48}  {}".format(
-            MARK.get(r["status"], "?"), r["index"], r["status"],
-            (r["name_a"] or "—")[:48], r["name_b"] or "—"))
-    return "\n".join(lines)
-
 #### extract() — per-class pipeline ###
 
 _DELETING_DTOR_RE = re.compile(r"D0Ev$")
 _DTOR_RE          = re.compile(r"D[12]Ev$")
+# address equality through these proves nothing about inheritance — every class's
+# copy of a pure/deleted-virtual trampoline or a byte-identical empty override can
+# legitimately (or via ICF) share one address. Never climb ownership through them.
+_SHARED_STUB_RE   = re.compile(r"^(__cxa_pure_virtual|__cxa_deleted_virtual|nullsub_\d+)$")
 
 def extract(classname, pseudo=False, structs=False):
     """
@@ -666,33 +639,26 @@ def extract(classname, pseudo=False, structs=False):
     result = {"class": classname, "ti_ea": None, "vtable_ea": None,
               "slots": [], "secondary_vtables": [], "struct_fields": {}, "error": None}
 
-    ti_ea = find_typeinfo(classname)
-    if ti_ea == BADADDR:
-        result["error"] = "no _ZTI found for '{}'".format(classname)
-        return result
-    result["ti_ea"] = ti_ea
-
-    chunks = vtable_chunks(ti_ea)
-    if not chunks:
-        result["error"] = "no usable vtable chunks for '{}'".format(classname)
-        return result
-
-    result["vtable_ea"] = chunks[0][1]
-
-    def _build_slots(vtbl_ea):
+    def _build_slots(vtbl_ea, owner_table, allow_climb):
         slots = []
         for idx, func_ea in enumerate(_raw_slots(vtbl_ea)):
-            owner  = slot_owner_fast(idx, func_ea, classname)
             raw_nm = _name(func_ea) if func_ea else ""
 
-            if func_ea == 0:
+            if func_ea == 0 or raw_nm == "__cxa_pure_virtual":
                 role = "pure_virtual"
+            elif raw_nm == "__cxa_deleted_virtual":
+                role = "deleted_virtual"
             elif _DELETING_DTOR_RE.search(raw_nm):
                 role = "deleting_dtor"
             elif _DTOR_RE.search(raw_nm):
                 role = "dtor"
             else:
                 role = "func"
+
+            # only ordinary virtual functions climb — dtors are always per-class by
+            # construction, and shared stubs prove nothing via address equality alone
+            climbable = allow_climb and func_ea and role == "func" and not _SHARED_STUB_RE.match(raw_nm)
+            owner = slot_owner(owner_table, classname, idx, func_ea) if climbable else classname
 
             slot = {
                 "index": idx, "ea": func_ea or None, "role": role, "owner": owner,
@@ -709,10 +675,35 @@ def extract(classname, pseudo=False, structs=False):
             slots.append(slot)
         return slots
 
-    result["slots"] = _build_slots(result["vtable_ea"])
+    ti_ea = find_typeinfo(classname)
+    if ti_ea == BADADDR:
+        # no RTTI — fall back to the vtable directly. No ancestor chain exists
+        # without a _ZTI, so ownership can never climb on this path.
+        vtbl_ea = find_vtable_direct(classname)
+        if vtbl_ea == BADADDR:
+            result["error"] = "no _ZTI or _ZTV found for '{}'".format(classname)
+            return result
+        result["vtable_ea"] = vtbl_ea
+        result["slots"] = _build_slots(vtbl_ea, owner_table=[], allow_climb=False)
+        if structs:
+            result["struct_fields"].setdefault(0, {"size": PTR_SIZE, "type": "void*"})
+        return result
+
+    result["ti_ea"] = ti_ea
+    chunks = vtable_chunks(ti_ea)
+    if not chunks:
+        result["error"] = "no usable vtable chunks for '{}'".format(classname)
+        return result
+
+    result["vtable_ea"] = chunks[0][1]
+    owner_table = _ancestor_owner_table(ti_ea, ott=0)
+
+    result["slots"] = _build_slots(result["vtable_ea"], owner_table, allow_climb=True)
     for ott, vtbl_ea in chunks[1:]:
+        sec_table = _ancestor_owner_table(ti_ea, ott=ott)
         result["secondary_vtables"].append({
-            "offset_to_top": ott, "vtable_ea": vtbl_ea, "slots": _build_slots(vtbl_ea)})
+            "offset_to_top": ott, "vtable_ea": vtbl_ea,
+            "slots": _build_slots(vtbl_ea, sec_table, allow_climb=True)})
 
     if structs:
         result["struct_fields"].setdefault(0, {"size": PTR_SIZE, "type": "void*"})
@@ -725,15 +716,13 @@ class _ExtractForm(idaapi.Form):
     def __init__(self):
         idaapi.Form.__init__(self, r"""STARTITEM 0
 Dumper
-Blank Classes = scan every _ZTV. Fill Diff to compare two classes (ignores checkboxes).
+Blank Classes = scan every _ZTV.
 <Classes      :{cnClasses}>
-<Diff against :{cnDiff}>
 <Output folder:{cnOutFile}>
 <##Options##Decompile pseudocode (Hex-Rays):{cPseudo}>
 <Recover struct fields + IDA structs:{cStructs}>{cGroup}>
 """, {
-            'cnClasses': idaapi.Form.StringInput(swidth=50),
-            'cnDiff':    idaapi.Form.StringInput(swidth=50),
+            'cnClasses': idaapi.Form.StringInput(swidth=56),
             'cnOutFile': idaapi.Form.DirInput(swidth=56),
             'cGroup':    idaapi.Form.ChkGroupControl(("cPseudo", "cStructs")),
         })
@@ -741,9 +730,9 @@ Blank Classes = scan every _ZTV. Fill Diff to compare two classes (ignores check
 
 class VtableExtractorPlugin(idaapi.plugin_t):
     flags         = idaapi.PLUGIN_UNL
-    comment       = "Extract + rename vtables from RTTI — v2.0"
+    comment       = "Extract vtables, structs, and pseudocode from RTTI"
     help          = "Ctrl-Shift-V"
-    wanted_name   = "VTable Extractor"
+    wanted_name   = "Dumper5000"
     wanted_hotkey = "Ctrl-Shift-V"
 
     def init(self):  return idaapi.PLUGIN_OK
@@ -758,7 +747,6 @@ class VtableExtractorPlugin(idaapi.plugin_t):
             f.Free(); return
 
         classes_raw = f.cnClasses.value.strip()
-        diff_b      = f.cnDiff.value.strip()
         out_dir     = f.cnOutFile.value
         do_pseudo, do_structs = f.cPseudo.checked, f.cStructs.checked
         f.Free()
@@ -772,23 +760,9 @@ class VtableExtractorPlugin(idaapi.plugin_t):
         if not classnames:
             idaapi.warning("No classes found (no _ZTV symbols)."); return
 
-        if diff_b:
-            rows = diff_vtables(classnames[0], diff_b)
-            text = format_diff(classnames[0], diff_b, rows)
-            idaapi.msg("\n" + text + "\n")
-            open(os.path.join(out_dir, "{}_vs_{}.diff.txt".format(
-                _safe_id(classnames[0]), _safe_id(diff_b))), "w", encoding="utf-8").write(text)
-            idaapi.info("Diff written to " + out_dir)
-            return
-
-        idaapi.show_wait_box("Pre-pass — building shared slot map…")
-        try:
-            build_shared_owner_map(classnames)
-        finally:
-            idaapi.hide_wait_box()
-
         written = structs_made = struct_mems = 0
         idaapi.show_wait_box("Extracting — 0 / {}".format(len(classnames)))
+        prev_batch = idc.batch(1)  # auto-answer Hex-Rays warning dialogs instead of stalling per-class
         try:
             for i, cn in enumerate(classnames):
                 if idaapi.user_cancelled(): break
@@ -824,6 +798,7 @@ class VtableExtractorPlugin(idaapi.plugin_t):
                     except Exception as ex:
                         idaapi.msg("  STRUCT ERROR {}: {}\n".format(safe, ex))
         finally:
+            idc.batch(prev_batch)
             idaapi.hide_wait_box()
 
         idaapi.info("Done.\n{} class(es)\n{} file(s) written\n{} struct(s) ({} members)\n{}".format(
